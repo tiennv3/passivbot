@@ -354,3 +354,5 @@ live_configs/*
 
 # Reports
 reports/*
+api-keys.json
+requirements.txt
