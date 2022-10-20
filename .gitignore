@@ -338,20 +338,19 @@ $RECYCLE.BIN/
 *.lnk
 
 # Backtest files
-!backtest_configs/xmr.hjson
-backtest_configs/*
-plots/
-backtest_results/
-
-# Run files
+backtests/
+!config/optimize/default.hjson
+!config/backtest/default.hjson
+config/
 historical_data/
+results_harmony_search/*
 
 # Config files
 api-keys.json
 !live_configs/binance_default.json
 !live_configs/bybit_default.json
 live_configs/*
-
+configs/live/multigrid.json
 # Reports
 reports/*
 api-keys.json

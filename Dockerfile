@@ -1,10 +1,7 @@
-FROM python:3.8-slim-buster
+FROM python:3.9-slim-bullseye
 
-WORKDIR /app
+COPY ./ /passivbot/
 
-# Telegram implementation require git to determine the version
-RUN apt-get update && apt-get install git -y
+WORKDIR /passivbot
 
-COPY requirements.txt /app
-
-RUN pip install -r requirements.txt
+RUN pip install -r requirements_liveonly.txt
