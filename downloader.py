@@ -4,18 +4,22 @@ import datetime
 import gzip
 import os
 import sys
+import requests
+import json
 from io import BytesIO
 from time import time
 from typing import Tuple
 from urllib.request import urlopen
 from zipfile import ZipFile
+import traceback
+import aiohttp
 
 import numpy as np
 import pandas as pd
 from dateutil import parser
 from tqdm import tqdm
 
-from njit_funcs import calc_samples
+from njit_funcs import calc_samples, round_up, round_dn, round_
 from procedures import (
     prepare_backtest_config,
     make_get_filepath,
@@ -26,7 +30,7 @@ from procedures import (
     add_argparse_args,
     utc_ms,
 )
-from pure_funcs import ts_to_date, ts_to_date_utc, date_to_ts, get_dummy_settings
+from pure_funcs import ts_to_date, ts_to_date_utc, date_to_ts2, get_dummy_settings, get_day
 
 
 class Downloader:
@@ -39,7 +43,9 @@ class Downloader:
         self.config = config
         # use binance data for bybit
         self.config["exchange"] = (
-            "binance" if self.config["exchange"] in ["bybit", "bitget"] else self.config["exchange"]
+            "binance"
+            if self.config["exchange"] in ["bybit", "bitget", "okx", "kucoin"]
+            else self.config["exchange"]
         )
         self.spot = "spot" in config and config["spot"]
         self.tick_filepath = os.path.join(
@@ -319,7 +325,7 @@ class Downloader:
         @return: Dataframe with full day.
         """
         print_(["Fetching", symbol, date])
-        url = "{}{}/{}-aggTrades-{}.zip".format(base_url, symbol.upper(), symbol.upper(), date)
+        url = f"{base_url}{symbol.upper()}/{symbol.upper()}-aggTrades-{date}.zip"
         df = pd.DataFrame(columns=["trade_id", "price", "qty", "timestamp", "is_buyer_maker"])
         column_names = [
             "trade_id",
@@ -345,11 +351,11 @@ class Downloader:
             with ZipFile(file_tmp) as my_zip_file:
                 for contained_file in my_zip_file.namelist():
                     tf = pd.read_csv(my_zip_file.open(contained_file), names=column_names)
-                    if tf.trade_id.iloc[0] == 'agg_trade_id':
+                    if tf.trade_id.iloc[0] == "agg_trade_id":
                         # catch cases where header is included as first row
-                        print('header in first row: attempting fix...')
+                        print("header in first row: attempting fix...")
                         tf = tf.iloc[1:].reset_index()
-                        tf.is_buyer_maker = tf.is_buyer_maker == 'true'
+                        tf.is_buyer_maker = tf.is_buyer_maker == "true"
                         tf.drop(
                             errors="ignore",
                             columns=["index"],
@@ -424,7 +430,7 @@ class Downloader:
                 return match, id_at_match
         raise Exception("unable to make trade ids")
 
-    async def get_csv_gz(self, base_url, symbol, date, df_for_id_matching):
+    async def get_csv_gz_old(self, base_url, symbol, date, df_for_id_matching):
         """
         Fetches a full day of trades from the Bybit repository.
         @param symbol: Symbol to fetch.
@@ -463,7 +469,6 @@ class Downloader:
         Downloads any missing data based on the specified time frame.
         @return:
         """
-
         if self.config["exchange"] == "binance":
             if self.spot:
                 self.bot = await create_binance_bot_spot(get_dummy_settings(self.config))
@@ -959,14 +964,158 @@ def get_zip(url: str):
         print(e)
 
 
-def download_ohlcvs(symbol, start_date, end_date, download_only=False) -> pd.DataFrame:
-    dirpath = make_get_filepath(f"historical_data/ohlcvs_futures/{symbol}/")
-    base_url = f"https://data.binance.vision/data/futures/um/"
+def get_first_ohlcv_ts(symbol: str, spot=False) -> int:
+    try:
+        if spot:
+            url = "https://api.binance.com/api/v3/klines"
+        else:
+            url = "https://fapi.binance.com/fapi/v1/klines"
+        res = requests.get(
+            url, params={"symbol": symbol, "startTime": 0, "limit": 100, "interval": "1m"}
+        )
+        first_ohlcvs = json.loads(res.text)
+        first_ts = first_ohlcvs[0][0]
+        print(f"first ohlcv at {ts_to_date(first_ts)}")
+        return first_ts
+    except Exception as e:
+        print(f"error getting first ohlcv ts {e}, returning 0")
+        return 0
+
+
+def findall(string, pattern):
+    """Yields all the positions of
+    the pattern in the string"""
+    i = string.find(pattern)
+    while i != -1:
+        yield i
+        i = string.find(pattern, i + 1)
+
+
+def get_days_in_between(start_day, end_day):
+    date_format = "%Y-%m-%d"
+    start_date = datetime.datetime.strptime(start_day, date_format)
+    end_date = datetime.datetime.strptime(end_day, date_format)
+
+    days_in_between = []
+    current_date = start_date
+    while current_date <= end_date:
+        days_in_between.append(current_date.strftime(date_format))
+        current_date += datetime.timedelta(days=1)
+
+    return days_in_between
+
+
+async def download_ohlcvs_bybit(symbol, start_date, end_date, download_only=False):
+    start_date, end_date = get_day(start_date), get_day(end_date)
+    assert date_to_ts2(end_date) >= date_to_ts2(start_date), "end_date is older than start_date"
+    dirpath = make_get_filepath(f"historical_data/ohlcvs_bybit/{symbol}/")
+    ideal_days = get_days_in_between(start_date, end_date)
+    days_done = [filename[:-4] for filename in os.listdir(dirpath) if ".csv" in filename]
+    days_to_get = [day for day in ideal_days if day not in days_done]
+    dfs = {}
+    if len(days_to_get) > 0:
+        base_url = "https://public.bybit.com/trading/"
+        webpage = await get_bybit_webpage(base_url, symbol)
+        filenames = [cand for day in days_to_get if (cand := f"{symbol}{day}.csv.gz") in webpage]
+        if len(filenames) > 0:
+            n_concurrent_fetches = 10
+            for i in range(0, len(filenames), 10):
+                filenames_sublist = filenames[i : i + n_concurrent_fetches]
+                print(
+                    f"fetching trades from {filenames_sublist[0][-17:-7]} to {filenames_sublist[-1][-17:-7]}"
+                )
+                dfs_ = await get_bybit_trades(base_url, symbol, filenames_sublist)
+                dfs_ = {k[-17:-7]: convert_to_ohlcv(v) for k, v in dfs_.items()}
+                dumped = []
+                for day, df in sorted(dfs_.items()):
+                    if day in days_done:
+                        continue
+                    filepath = f"{dirpath}{day}.csv"
+                    df.to_csv(filepath)
+                    dumped.append(day)
+                if not download_only:
+                    dfs.update(dfs_)
+    if not download_only:
+        for day in ideal_days:
+            if day not in days_to_get:
+                dfs[day] = pd.read_csv(f"{dirpath}{day}.csv")
+        if len(dfs) == 0:
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df = pd.concat(dfs.values()).sort_values("timestamp").reset_index()
+        return df[["timestamp", "open", "high", "low", "close", "volume"]]
+
+
+async def get_bybit_webpage(base_url: str, symbol: str):
+    return urlopen(f"{base_url}{symbol}/").read().decode()
+
+
+async def get_bybit_trades(base_url: str, symbol: str, filenames: [str]):
+    if len(filenames) == 0:
+        return None
+    async with aiohttp.ClientSession() as session:
+        tasks = {}
+        for url in [f"{base_url}{symbol}/{filename}" for filename in filenames]:
+            tasks[url] = asyncio.ensure_future(get_csv_gz(session, url))
+        responses = {}
+        for url in tasks:
+            responses[url] = await tasks[url]
+    return {k: v.sort_values("timestamp") for k, v in responses.items()}
+
+
+async def fetch_url(session, url):
+    async with session.get(url) as response:
+        content = await response.read()
+        return content
+
+
+async def get_csv_gz(session, url: str):
+    # from bybit
+    try:
+        resp = await fetch_url(session, url)
+        with gzip.open(BytesIO(resp)) as f:
+            tdf = pd.read_csv(f)
+        return tdf
+    except Exception as e:
+        print("error fetching bybit trades", e)
+        traceback.print_exc()
+        return pd.DataFrame()
+
+
+def convert_to_ohlcv(df, interval=60000):
+    # bybit data
+    # timestamps are in seconds
+    groups = df.groupby((df.timestamp * 1000) // interval * interval)
+    ohlcvs = pd.DataFrame(
+        {
+            "open": groups.price.first(),
+            "high": groups.price.max(),
+            "low": groups.price.min(),
+            "close": groups.price.last(),
+            "volume": groups["size"].sum(),
+        }
+    )
+    new_index = np.arange(ohlcvs.index[0], ohlcvs.index[-1] + interval, interval)
+    ohlcvs = ohlcvs.reindex(new_index)
+    closes = ohlcvs.close.fillna(method="ffill")
+    for x in ["open", "high", "low", "close"]:
+        ohlcvs[x] = ohlcvs[x].fillna(closes)
+    ohlcvs["volume"] = ohlcvs["volume"].fillna(0.0)
+    return ohlcvs
+
+
+def download_ohlcvs(
+    symbol, inverse, start_date, end_date, spot=False, download_only=False
+) -> pd.DataFrame:
+    dirpath = make_get_filepath(f"historical_data/ohlcvs_{'spot' if spot else 'futures'}/{symbol}/")
+    base_url = "https://data.binance.vision/data/"
+    base_url += "spot/" if spot else f"futures/{'cm' if inverse else 'um'}/"
     col_names = ["timestamp", "open", "high", "low", "close", "volume"]
-    start_ts = date_to_ts(start_date)
-    end_ts = date_to_ts(end_date)
+    start_ts = int(max(get_first_ohlcv_ts(symbol, spot=spot), date_to_ts2(start_date)))
+    end_ts = int(date_to_ts2(end_date))
     days = [ts_to_date_utc(x)[:10] for x in list(range(start_ts, end_ts, 1000 * 60 * 60 * 24))]
-    months = sorted(set([x[:7] for x in days]))
+    months = sorted({x[:7] for x in days})
+    month_now = ts_to_date(time())[:7]
+    months = [m for m in months if m != month_now]
     months_done = set()
     dfs = []
     for month in months:
@@ -1018,24 +1167,52 @@ def download_ohlcvs(symbol, start_date, end_date, download_only=False) -> pd.Dat
         )
 
 
-def load_hlc_cache(
-    symbol, start_date, end_date, base_dir="backtests", spot=False, exchange="binance"
+def count_longest_identical_data(hlc, symbol):
+    line = f"checking ohlcv integrity of {symbol}"
+    diffs = (np.diff(hlc[:, 1:], axis=0) == [0.0, 0.0, 0.0]).all(axis=1)
+    longest_consecutive = 0
+    counter = 0
+    i_ = 0
+    for i, x in enumerate(diffs):
+        if x:
+            counter += 1
+        else:
+            if counter > longest_consecutive:
+                longest_consecutive = counter
+                i_ = i
+            counter = 0
+    print(
+        f"{symbol} most n days of consecutive identical ohlcvs: {longest_consecutive / 60 / 24:.3f}, index last: {i_}"
+    )
+    return longest_consecutive
+
+
+async def load_hlc_cache(
+    symbol, inverse, start_date, end_date, base_dir="backtests", spot=False, exchange="binance"
 ):
     cache_fname = (
-        f"{ts_to_date_utc(date_to_ts(start_date))[:10]}_"
-        + f"{ts_to_date_utc(date_to_ts(end_date))[:10]}_ohlcv_cache.npy"
+        f"{ts_to_date_utc(date_to_ts2(start_date))[:10]}_"
+        + f"{ts_to_date_utc(date_to_ts2(end_date))[:10]}_ohlcv_cache.npy"
     )
 
     filepath = make_get_filepath(
         os.path.join(base_dir, exchange + ("_spot" if spot else ""), symbol, "caches", cache_fname)
     )
     if os.path.exists(filepath):
-        return np.load(filepath)
-    df = download_ohlcvs(symbol, start_date, end_date)
-    df = df[df.timestamp >= date_to_ts(start_date)]
-    df = df[df.timestamp <= date_to_ts(end_date)]
-    data = df[["timestamp", "high", "low", "close"]].values
-    np.save(filepath, data)
+        data = np.load(filepath)
+    else:
+        if exchange == "bybit":
+            df = await download_ohlcvs_bybit(symbol, start_date, end_date, download_only=False)
+        else:
+            df = download_ohlcvs(symbol, inverse, start_date, end_date, spot)
+        df = df[df.timestamp >= date_to_ts2(start_date)]
+        df = df[df.timestamp <= date_to_ts2(end_date)]
+        data = df[["timestamp", "high", "low", "close"]].values
+        np.save(filepath, data)
+    try:
+        count_longest_identical_data(data, symbol)
+    except Exception as e:
+        print("error checking integrity", e)
     return data
 
 
@@ -1049,18 +1226,19 @@ async def main():
         help="download only, do not dump ticks caches",
         action="store_true",
     )
-    parser.add_argument(
-        "-oh",
-        "--ohlcv",
-        help="use 1m ohlcv instead of 1s ticks",
-        action="store_true",
-    )
     parser = add_argparse_args(parser)
 
     args = parser.parse_args()
     config = await prepare_backtest_config(args)
-    if args.ohlcv:
-        data = load_hlc_cache(config["symbol"], config["start_date"], config["end_date"])
+    if config["ohlcv"]:
+        data = await load_hlc_cache(
+            config["symbol"],
+            config["inverse"],
+            config["start_date"],
+            config["end_date"],
+            spot=config["spot"],
+            exchange=config["exchange"],
+        )
     else:
         downloader = Downloader(config)
         await downloader.download_ticks()

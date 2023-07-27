@@ -12,11 +12,12 @@ import aiohttp
 import base64
 import numpy as np
 import pprint
+import os
 
 from njit_funcs import round_
-from passivbot import Bot
-from procedures import print_async_exception, print_
-from pure_funcs import ts_to_date, sort_dict_keys, date_to_ts
+from passivbot import Bot, logging
+from procedures import print_async_exception, print_, utc_ms, make_get_filepath
+from pure_funcs import ts_to_date, sort_dict_keys, date_to_ts, format_float, flatten
 
 
 def first_capitalized(s: str):
@@ -24,26 +25,36 @@ def first_capitalized(s: str):
 
 
 def truncate_float(x: float, d: int) -> float:
-    xs = str(x)
-    return float(xs[: xs.find(".") + d + 1])
+    if x is None:
+        return 0.0
+    multiplier = 10 ** d
+    return int(x * multiplier) / multiplier
 
 
 class BitgetBot(Bot):
     def __init__(self, config: dict):
+        self.is_logged_into_user_stream = False
         self.exchange = "bitget"
+        self.max_n_orders_per_batch = 50
+        self.max_n_cancellations_per_batch = 60
         super().__init__(config)
         self.base_endpoint = "https://api.bitget.com"
         self.endpoints = {
             "exchange_info": "/api/mix/v1/market/contracts",
-            "funds_transfer": "/asset/v1/private/transfer",
+            "funds_transfer": "/api/spot/v1/wallet/transfer-v2",
             "position": "/api/mix/v1/position/singlePosition",
             "balance": "/api/mix/v1/account/accounts",
             "ticker": "/api/mix/v1/market/ticker",
+            "tickers": "/api/mix/v1/market/tickers",
             "open_orders": "/api/mix/v1/order/current",
+            "open_orders_all": "/api/mix/v1/order/marginCoinCurrent",
             "create_order": "/api/mix/v1/order/placeOrder",
+            "batch_orders": "/api/mix/v1/order/batch-orders",
+            "batch_cancel_orders": "/api/mix/v1/order/cancel-batch-orders",
             "cancel_order": "/api/mix/v1/order/cancel-order",
             "ticks": "/api/mix/v1/market/fills",
             "fills": "/api/mix/v1/order/fills",
+            "fills_detailed": "/api/mix/v1/order/history",
             "ohlcvs": "/api/mix/v1/market/candles",
             "websocket_market": "wss://ws.bitget.com/mix/v1/stream",
             "websocket_user": "wss://ws.bitget.com/mix/v1/stream",
@@ -55,23 +66,13 @@ class BitgetBot(Bot):
             "sell": {"long": "close_long", "short": "open_short"},
         }
         self.fill_side_map = {
+            "burst_close_long": "sell",
+            "burst_close_short": "buy",
             "close_long": "sell",
             "open_long": "buy",
             "close_short": "buy",
             "open_short": "sell",
         }
-        self.interval_map = {
-            "1m": "60",
-            "5m": "300",
-            "15m": "900",
-            "30m": "1800",
-            "1h": "3600",
-            "4h": "14400",
-            "12h": "43200",
-            "1d": "86400",
-            "1w": "604800",
-        }
-        self.broker_code = "Passivbot"
         self.session = aiohttp.ClientSession()
 
     def init_market_type(self):
@@ -82,7 +83,7 @@ class BitgetBot(Bot):
             self.market_type += "_linear_perpetual"
             self.product_type = "umcbl"
             self.inverse = self.config["inverse"] = False
-            self.min_cost = self.config["min_cost"] = 5.1
+            self.min_cost = self.config["min_cost"] = 5.5
         elif self.symbol.endswith("USD"):
             print("inverse perpetual")
             self.symbol += "_DMCBL"
@@ -106,10 +107,10 @@ class BitgetBot(Bot):
         self.coin = e["baseCoin"]
         self.quote = e["quoteCoin"]
         self.price_step = self.config["price_step"] = round_(
-            (10 ** (-int(e["pricePlace"]))) * int(e["priceEndStep"]), 0.00000001
+            (10 ** (-int(e["pricePlace"]))) * int(e["priceEndStep"]), 1e-12
         )
         self.price_rounding = int(e["pricePlace"])
-        self.qty_step = self.config["qty_step"] = round_(10 ** (-int(e["volumePlace"])), 0.00000001)
+        self.qty_step = self.config["qty_step"] = float(e["sizeMultiplier"])
         self.min_qty = self.config["min_qty"] = float(e["minTradeNum"])
         self.margin_coin = self.coin if self.product_type == "dmcbl" else self.quote
         await super()._init()
@@ -133,13 +134,35 @@ class BitgetBot(Bot):
             "last": float(ticker["data"]["last"]),
         }
 
-    async def init_order_book(self):
-        ticker = await self.fetch_ticker()
-        self.ob = [
-            ticker["bid"],
-            ticker["ask"],
+    async def fetch_tickers(self, product_type=None):
+        tickers = await self.public_get(
+            self.endpoints["tickers"],
+            params={"productType": self.product_type if product_type is None else product_type},
+        )
+        return [
+            {
+                "symbol": ticker["symbol"],
+                "bid": 0.0 if ticker["bestBid"] is None else float(ticker["bestBid"]),
+                "ask": 0.0 if ticker["bestAsk"] is None else float(ticker["bestAsk"]),
+                "last": 0.0 if ticker["last"] is None else float(ticker["last"]),
+            }
+            for ticker in tickers["data"]
         ]
-        self.price = ticker["last"]
+
+    async def init_order_book(self):
+        ticker = None
+        try:
+            ticker = await self.fetch_ticker()
+            self.ob = [
+                ticker["bid"],
+                ticker["ask"],
+            ]
+            self.price = ticker["last"]
+            return True
+        except Exception as e:
+            logging.error(f"error updating order book {e}")
+            print_async_exception(ticker)
+            return False
 
     async def fetch_open_orders(self) -> [dict]:
         fetched = await self.private_get(self.endpoints["open_orders"], {"symbol": self.symbol})
@@ -157,19 +180,58 @@ class BitgetBot(Bot):
             for elm in fetched["data"]
         ]
 
+    async def fetch_open_orders_all(self) -> [dict]:
+        fetched = await self.private_get(
+            self.endpoints["open_orders_all"], {"productType": self.product_type}
+        )
+        return [
+            {
+                "order_id": elm["orderId"],
+                "custom_id": elm["clientOid"],
+                "symbol": elm["symbol"],
+                "price": float(elm["price"]),
+                "qty": float(elm["size"]),
+                "side": "buy" if elm["side"] in ["close_short", "open_long"] else "sell",
+                "position_side": elm["posSide"],
+                "timestamp": float(elm["cTime"]),
+            }
+            for elm in fetched["data"]
+        ]
+
     async def public_get(self, url: str, params: dict = {}) -> dict:
-        async with self.session.get(self.base_endpoint + url, params=params) as response:
-            result = await response.text()
-        return json.loads(result)
+        result = None
+        response_ = None
+        try:
+            async with self.session.get(self.base_endpoint + url, params=params) as response:
+                response_ = response
+                result = await response.text()
+            return json.loads(result)
+        except Exception as e:
+            logging.error(f"error with json decoding {url} {params} {e}")
+            traceback.print_exc()
+            print_async_exception(result)
+            print_async_exception(response_)
+            raise Exception
 
     async def private_(
         self, type_: str, base_endpoint: str, url: str, params: dict = {}, json_: bool = False
     ) -> dict:
+        def stringify(x):
+            if type(x) == bool:
+                return "true" if x else "false"
+            elif type(x) == float:
+                return format_float(x)
+            elif type(x) == int:
+                return str(x)
+            elif type(x) == list:
+                return [stringify(y) for y in x]
+            elif type(x) == dict:
+                return {k: stringify(v) for k, v in x.items()}
+            else:
+                return x
 
         timestamp = int(time() * 1000)
-        params = {
-            k: ("true" if v else "false") if type(v) == bool else str(v) for k, v in params.items()
-        }
+        params = {k: stringify(v) for k, v in params.items()}
         if type_ == "get":
             url = url + "?" + urlencode(sort_dict_keys(params))
             to_sign = str(timestamp) + type_.upper() + url
@@ -217,13 +279,11 @@ class BitgetBot(Bot):
         )
 
     async def transfer_from_derivatives_to_spot(self, coin: str, amount: float):
-        raise NotImplementedError("not implemented")
         params = {
-            "coin": coin,
+            "coin": "USDT",
             "amount": str(amount),
-            "from_account_type": "CONTRACT",
-            "to_account_type": "SPOT",
-            "transfer_id": str(uuid4()),
+            "from_account_type": "mix_usdt",
+            "to_account_type": "spot",
         }
         return await self.private_(
             "post", self.base_endpoint, self.endpoints["funds_transfer"], params=params, json_=True
@@ -254,15 +314,23 @@ class BitgetBot(Bot):
             if elm["holdSide"] == "long":
                 position["long"] = {
                     "size": round_(float(elm["total"]), self.qty_step),
-                    "price": truncate_float(float(elm["averageOpenPrice"]), self.price_rounding),
-                    "liquidation_price": float(elm["liquidationPrice"]),
+                    "price": 0.0
+                    if elm["averageOpenPrice"] is None
+                    else float(elm["averageOpenPrice"]),
+                    "liquidation_price": 0.0
+                    if elm["liquidationPrice"] is None
+                    else float(elm["liquidationPrice"]),
                 }
 
             elif elm["holdSide"] == "short":
                 position["short"] = {
                     "size": -abs(round_(float(elm["total"]), self.qty_step)),
-                    "price": truncate_float(float(elm["averageOpenPrice"]), self.price_rounding),
-                    "liquidation_price": float(elm["liquidationPrice"]),
+                    "price": 0.0
+                    if elm["averageOpenPrice"] is None
+                    else float(elm["averageOpenPrice"]),
+                    "liquidation_price": 0.0
+                    if elm["liquidationPrice"] is None
+                    else float(elm["liquidationPrice"]),
                 }
         for elm in fetched_balance["data"]:
             if elm["marginCoin"] == self.margin_coin:
@@ -278,6 +346,13 @@ class BitgetBot(Bot):
                 break
 
         return position
+
+    async def execute_orders(self, orders: [dict]) -> [dict]:
+        if len(orders) == 0:
+            return []
+        if len(orders) == 1:
+            return [await self.execute_order(orders[0])]
+        return await self.execute_batch_orders(orders)
 
     async def execute_order(self, order: dict) -> dict:
         o = None
@@ -300,6 +375,7 @@ class BitgetBot(Bot):
             custom_id = order["custom_id"] if "custom_id" in order else "0"
             params["clientOid"] = f"{self.broker_code}#{custom_id}_{random_str}"
             o = await self.private_post(self.endpoints["create_order"], params)
+            # print('debug create order', o, order)
             if o["data"]:
                 # print('debug execute order', o)
                 return {
@@ -319,27 +395,81 @@ class BitgetBot(Bot):
             traceback.print_exc()
             return {}
 
-    async def execute_cancellation(self, order: dict) -> dict:
-        cancellation = None
+    async def execute_batch_orders(self, orders: [dict]) -> [dict]:
+        executed = None
         try:
-            cancellation = await self.private_post(
-                self.endpoints["cancel_order"],
-                {"symbol": self.symbol, "marginCoin": self.margin_coin, "orderId": order["order_id"]},
+            to_execute = []
+            orders_with_custom_ids = []
+            for order in orders:
+                params = {
+                    "size": str(order["qty"]),
+                    "side": self.order_side_map[order["side"]][order["position_side"]],
+                    "orderType": order["type"],
+                    "presetTakeProfitPrice": "",
+                    "presetStopLossPrice": "",
+                }
+                if params["orderType"] == "limit":
+                    params["timeInForceValue"] = "post_only"
+                    params["price"] = str(order["price"])
+                else:
+                    params["timeInForceValue"] = "normal"
+                random_str = f"{str(int(time() * 1000))[-6:]}_{int(np.random.random() * 10000)}"
+                custom_id = order["custom_id"] if "custom_id" in order else "0"
+                params["clientOid"] = order[
+                    "custom_id"
+                ] = f"{self.broker_code}#{custom_id}_{random_str}"
+                orders_with_custom_ids.append({**order, **{"symbol": self.symbol}})
+                to_execute.append(params)
+            executed = await self.private_post(
+                self.endpoints["batch_orders"],
+                {"symbol": self.symbol, "marginCoin": self.margin_coin, "orderDataList": to_execute},
             )
-            return {
-                "symbol": self.symbol,
-                "side": order["side"],
-                "order_id": cancellation["data"]["orderId"],
-                "position_side": order["position_side"],
-                "qty": order["qty"],
-                "price": order["price"],
-            }
+            formatted = []
+            for ex in executed["data"]["orderInfo"]:
+                to_add = {"order_id": ex["orderId"], "custom_id": ex["clientOid"]}
+                for elm in orders_with_custom_ids:
+                    if elm["custom_id"] == ex["clientOid"]:
+                        to_add.update(elm)
+                        formatted.append(to_add)
+                        break
+            # print('debug execute batch orders', executed, orders, formatted)
+            return formatted
         except Exception as e:
-            print(f"error cancelling order {order} {e}")
-            print_async_exception(cancellation)
+            print(f"error executing order {executed} {e}")
+            print_async_exception(executed)
             traceback.print_exc()
-            self.ts_released["force_update"] = 0.0
-            return {}
+            return []
+
+    async def execute_cancellations(self, orders: [dict]) -> [dict]:
+        if not orders:
+            return []
+        cancellations = []
+        symbol = orders[0]["symbol"] if "symbol" in orders[0] else self.symbol
+        try:
+            cancellations = await self.private_post(
+                self.endpoints["batch_cancel_orders"],
+                {
+                    "symbol": symbol,
+                    "marginCoin": self.margin_coin,
+                    "orderIds": [order["order_id"] for order in orders],
+                },
+            )
+
+            formatted = []
+            for oid in cancellations["data"]["order_ids"]:
+                to_add = {"order_id": oid}
+                for order in orders:
+                    if order["order_id"] == oid:
+                        to_add.update(order)
+                        formatted.append(to_add)
+                        break
+            # print('debug cancel batch orders', cancellations, orders, formatted)
+            return formatted
+        except Exception as e:
+            logging.error(f"error cancelling orders {orders} {e}")
+            print_async_exception(cancellations)
+            traceback.print_exc()
+            return []
 
     async def fetch_account(self):
         raise NotImplementedError("not implemented")
@@ -387,13 +517,29 @@ class BitgetBot(Bot):
 
     async def fetch_ohlcvs(self, symbol: str = None, start_time: int = None, interval="1m"):
         # m -> minutes, h -> hours, d -> days, w -> weeks
-        assert interval in self.interval_map, f"unsupported interval {interval}"
+        interval_map = {
+            "1m": ("1m", 60),
+            "3m": ("3m", 60 * 3),
+            "5m": ("5m", 60 * 5),
+            "15m": ("15m", 60 * 15),
+            "30m": ("30m", 60 * 30),
+            "1h": ("1H", 60 * 60),
+            "2h": ("2H", 60 * 60 * 2),
+            "4h": ("4H", 60 * 60 * 4),
+            "6h": ("6H", 60 * 60 * 4),
+            "12h": ("12H", 60 * 60 * 12),
+            "1d": ("1D", 60 * 60 * 24),
+            "3d": ("3D", 60 * 60 * 24 * 3),
+            "1w": ("1W", 60 * 60 * 24 * 7),
+            "1M": ("1M", 60 * 60 * 24 * 30),
+        }
+        assert interval in interval_map, f"unsupported interval {interval}"
         params = {
             "symbol": self.symbol if symbol is None else symbol,
-            "granularity": self.interval_map[interval],
+            "granularity": interval_map[interval][0],
         }
         limit = 100
-        seconds = float(self.interval_map[interval])
+        seconds = float(interval_map[interval][1])
         if start_time is None:
             server_time = await self.get_server_time()
             params["startTime"] = int(round(float(server_time)) - 1000 * seconds * limit)
@@ -417,95 +563,171 @@ class BitgetBot(Bot):
         self,
         symbol: str = None,
         start_time: int = None,
-        income_type: str = "Trade",
         end_time: int = None,
     ):
-        raise NotImplementedError("not implemented")
-        if symbol is None:
-            all_income = []
-            all_positions = await self.private_get(self.endpoints["position"], params={"symbol": ""})
-            symbols = sorted(
-                set(
-                    [
-                        x["data"]["symbol"]
-                        for x in all_positions["result"]
-                        if float(x["data"]["size"]) > 0
-                    ]
-                )
-            )
-            for symbol in symbols:
-                all_income += await self.get_all_income(
-                    symbol=symbol, start_time=start_time, income_type=income_type, end_time=end_time
-                )
-            return sorted(all_income, key=lambda x: x["timestamp"])
-        limit = 50
-        income = []
-        page = 1
+        if end_time is None:
+            end_time = utc_ms() + 1000 * 60 * 60 * 6
+        if start_time is None:
+            start_time = utc_ms() - 1000 * 60 * 60 * 24 * 3
+        all_fills = []
+        all_fills_ids = set()
         while True:
-            fetched = await self.fetch_income(
-                symbol=symbol,
-                start_time=start_time,
-                income_type=income_type,
-                limit=limit,
-                page=page,
-            )
-            if len(fetched) == 0:
+            fills = await self.fetch_fills(symbol=symbol, start_time=start_time, end_time=end_time)
+            # latest fills returned first
+            if not fills:
                 break
-            print_(["fetched income", symbol, ts_to_date(fetched[0]["timestamp"])])
-            if fetched == income[-len(fetched) :]:
+            new_fills = []
+            for elm in fills:
+                if elm["id"] not in all_fills_ids:
+                    new_fills.append(elm)
+                    all_fills_ids.add(elm["id"])
+            if not new_fills:
                 break
-            income += fetched
-            if len(fetched) < limit:
-                break
-            page += 1
-        income_d = {e["transaction_id"]: e for e in income}
-        return sorted(income_d.values(), key=lambda x: x["timestamp"])
+            end_time = fills[-1]["timestamp"]
+            all_fills += new_fills
+        income = [
+            {
+                "symbol": elm["symbol"],
+                "transaction_id": elm["id"],
+                "income": elm["realized_pnl"],
+                "token": self.quote,
+                "timestamp": elm["timestamp"],
+            }
+            for elm in all_fills
+        ]
+        return sorted([elm for elm in income if elm["income"] != 0.0], key=lambda x: x["timestamp"])
 
     async def fetch_income(
         self,
         symbol: str = None,
-        income_type: str = None,
-        limit: int = 50,
         start_time: int = None,
         end_time: int = None,
-        page=None,
     ):
-        raise NotImplementedError("not implemented")
-        params = {"limit": limit, "symbol": self.symbol if symbol is None else symbol}
-        if start_time is not None:
-            params["start_time"] = int(start_time / 1000)
-        if end_time is not None:
-            params["end_time"] = int(end_time / 1000)
-        if income_type is not None:
-            params["exec_type"] = first_capitalized(income_type)
-        if page is not None:
-            params["page"] = page
+        raise NotImplementedError
+
+    async def fetch_latest_fills_new(self):
+        cached = None
+        fname = make_get_filepath(f"logs/fills_cached_bitget/{self.user}_{self.symbol}.json")
+        try:
+            if os.path.exists(fname):
+                cached = json.load(open(fname))
+            else:
+                cached = []
+        except Exception as e:
+            logging.error("error loading fills cache", e)
+            traceback.print_exc()
+            cached = []
+        fetched = None
+        lookback_since = int(
+            utc_ms() - max(flatten([v for k, v in self.xk.items() if "delay_between_fills_ms" in k]))
+        )
+        try:
+            params = {
+                "symbol": self.symbol,
+                "startTime": lookback_since,
+                "endTime": int(utc_ms() + 1000 * 60 * 60 * 2),
+                "pageSize": 100,
+            }
+            fetched = await self.private_get(self.endpoints["fills_detailed"], params)
+            if (
+                fetched["code"] == "00000"
+                and fetched["msg"] == "success"
+                and fetched["data"]["orderList"] is None
+            ):
+                return []
+            fetched = fetched["data"]["orderList"]
+            k = 0
+            while fetched and float(fetched[-1]["cTime"]) > utc_ms() - 1000 * 60 * 60 * 24 * 3:
+                k += 1
+                if k > 5:
+                    break
+                params["endTime"] = int(float(fetched[-1]["cTime"]))
+                fetched2 = (await self.private_get(self.endpoints["fills_detailed"], params))["data"][
+                    "orderList"
+                ]
+                if fetched2[-1] == fetched[-1]:
+                    break
+                fetched_d = {x["orderId"]: x for x in fetched + fetched2}
+                fetched = sorted(fetched_d.values(), key=lambda x: float(x["cTime"]), reverse=True)
+            fills = [
+                {
+                    "order_id": elm["orderId"],
+                    "symbol": elm["symbol"],
+                    "status": elm["state"],
+                    "custom_id": elm["clientOid"],
+                    "price": float(elm["priceAvg"]),
+                    "qty": float(elm["filledQty"]),
+                    "original_qty": float(elm["size"]),
+                    "type": elm["orderType"],
+                    "reduce_only": elm["reduceOnly"],
+                    "side": "buy" if elm["side"] in ["close_short", "open_long"] else "sell",
+                    "position_side": elm["posSide"],
+                    "timestamp": float(elm["cTime"]),
+                }
+                for elm in fetched
+                if "filled" in elm["state"]
+            ]
+        except Exception as e:
+            print("error fetching latest fills", e)
+            print_async_exception(fetched)
+            traceback.print_exc()
+            return []
+        return fills
+
+    async def fetch_latest_fills(self):
         fetched = None
         try:
-            fetched = await self.private_get(self.endpoints["income"], params)
-            if fetched["result"]["data"] is None:
+            params = {
+                "symbol": self.symbol,
+                "startTime": int(utc_ms() - 1000 * 60 * 60 * 24 * 6),
+                "endTime": int(utc_ms() + 1000 * 60 * 60 * 2),
+                "pageSize": 100,
+            }
+            fetched = await self.private_get(self.endpoints["fills_detailed"], params)
+            if (
+                fetched["code"] == "00000"
+                and fetched["msg"] == "success"
+                and fetched["data"]["orderList"] is None
+            ):
                 return []
-            return sorted(
-                [
-                    {
-                        "symbol": e["symbol"],
-                        "income_type": e["exec_type"].lower(),
-                        "income": float(e["closed_pnl"]),
-                        "token": self.margin_coin,
-                        "timestamp": float(e["created_at"]) * 1000,
-                        "info": {"page": fetched["result"]["current_page"]},
-                        "transaction_id": float(e["id"]),
-                        "trade_id": e["order_id"],
-                    }
-                    for e in fetched["result"]["data"]
-                ],
-                key=lambda x: x["timestamp"],
-            )
+            fetched = fetched["data"]["orderList"]
+            k = 0
+            while fetched and float(fetched[-1]["cTime"]) > utc_ms() - 1000 * 60 * 60 * 24 * 3:
+                k += 1
+                if k > 5:
+                    break
+                params["endTime"] = int(float(fetched[-1]["cTime"]))
+                fetched2 = (await self.private_get(self.endpoints["fills_detailed"], params))["data"][
+                    "orderList"
+                ]
+                if fetched2[-1] == fetched[-1]:
+                    break
+                fetched_d = {x["orderId"]: x for x in fetched + fetched2}
+                fetched = sorted(fetched_d.values(), key=lambda x: float(x["cTime"]), reverse=True)
+            fills = [
+                {
+                    "order_id": elm["orderId"],
+                    "symbol": elm["symbol"],
+                    "status": elm["state"],
+                    "custom_id": elm["clientOid"],
+                    "price": float(elm["priceAvg"]),
+                    "qty": float(elm["filledQty"]),
+                    "original_qty": float(elm["size"]),
+                    "type": elm["orderType"],
+                    "reduce_only": elm["reduceOnly"],
+                    "side": "buy" if elm["side"] in ["close_short", "open_long"] else "sell",
+                    "position_side": elm["posSide"],
+                    "timestamp": float(elm["cTime"]),
+                }
+                for elm in fetched
+                if "filled" in elm["state"]
+            ]
         except Exception as e:
-            print("error fetching income: ", e)
-            traceback.print_exc()
+            print("error fetching latest fills", e)
             print_async_exception(fetched)
+            traceback.print_exc()
             return []
+        return fills
 
     async def fetch_fills(
         self,
@@ -524,8 +746,10 @@ class BitgetBot(Bot):
         else:
             params["startTime"] = int(round(start_time))
 
-        # always fetch as many fills as possible
-        params["endTime"] = int(round(time() + 60 * 60 * 24) * 1000)
+        if end_time is None:
+            params["endTime"] = int(round(time() + 60 * 60 * 24) * 1000)
+        else:
+            params["endTime"] = int(round(end_time + 1))
         try:
             fetched = await self.private_get(self.endpoints["fills"], params)
             fills = [
@@ -567,11 +791,15 @@ class BitgetBot(Bot):
             # set leverage
             res = await self.private_post(
                 self.endpoints["set_leverage"],
-                params={"symbol": self.symbol, "marginCoin": self.margin_coin, "leverage": 20},
+                params={
+                    "symbol": self.symbol,
+                    "marginCoin": self.margin_coin,
+                    "leverage": self.leverage,
+                },
             )
             print(res)
         except Exception as e:
-            print(e)
+            print("error initiating exchange config", e)
 
     def standardize_market_stream_event(self, data: dict) -> [dict]:
         if "action" not in data or data["action"] != "update":
@@ -610,7 +838,7 @@ class BitgetBot(Bot):
                 print_(["error sending heartbeat market", e])
 
     async def subscribe_to_market_stream(self, ws):
-        await ws.send(
+        res = await ws.send(
             json.dumps(
                 {
                     "op": "subscribe",
@@ -625,31 +853,7 @@ class BitgetBot(Bot):
             )
         )
 
-    async def subscribe_to_user_stream(self, ws):
-        timestamp = int(time())
-        signature = base64.b64encode(
-            hmac.new(
-                self.secret.encode("utf-8"),
-                f"{timestamp}GET/user/verify".encode("utf-8"),
-                digestmod="sha256",
-            ).digest()
-        ).decode("utf-8")
-        res = await ws.send(
-            json.dumps(
-                {
-                    "op": "login",
-                    "args": [
-                        {
-                            "apiKey": self.key,
-                            "passphrase": self.passphrase,
-                            "timestamp": timestamp,
-                            "sign": signature,
-                        }
-                    ],
-                }
-            )
-        )
-        print(res)
+    async def subscribe_to_user_streams(self, ws):
         res = await ws.send(
             json.dumps(
                 {
@@ -696,14 +900,50 @@ class BitgetBot(Bot):
         )
         print(res)
 
+    async def subscribe_to_user_stream(self, ws):
+        if self.is_logged_into_user_stream:
+            await self.subscribe_to_user_streams(ws)
+        else:
+            await self.login_to_user_stream(ws)
+
+    async def login_to_user_stream(self, ws):
+        timestamp = int(time())
+        signature = base64.b64encode(
+            hmac.new(
+                self.secret.encode("utf-8"),
+                f"{timestamp}GET/user/verify".encode("utf-8"),
+                digestmod="sha256",
+            ).digest()
+        ).decode("utf-8")
+        res = await ws.send(
+            json.dumps(
+                {
+                    "op": "login",
+                    "args": [
+                        {
+                            "apiKey": self.key,
+                            "passphrase": self.passphrase,
+                            "timestamp": timestamp,
+                            "sign": signature,
+                        }
+                    ],
+                }
+            )
+        )
+        print(res)
+
     async def transfer(self, type_: str, amount: float, asset: str = "USDT"):
-        return {"code": "-1", "msg": "Transferring funds not supported for Bybit"}
+        return {"code": "-1", "msg": "Transferring funds not supported for Bitget"}
 
     def standardize_user_stream_event(
         self, event: Union[List[Dict], Dict]
     ) -> Union[List[Dict], Dict]:
 
         events = []
+        if "event" in event and event["event"] == "login":
+            self.is_logged_into_user_stream = True
+            return {"logged_in": True}
+        # logging.info(f"debug 0 {event}")
         if "arg" in event and "data" in event and "channel" in event["arg"]:
             if event["arg"]["channel"] == "orders":
                 for elm in event["data"]:
@@ -730,18 +970,25 @@ class BitgetBot(Bot):
                             standardized["filled"] = True
                         events.append(standardized)
             if event["arg"]["channel"] == "positions":
+                long_pos = {"psize_long": 0.0, "pprice_long": 0.0}
+                short_pos = {"psize_short": 0.0, "pprice_short": 0.0}
                 for elm in event["data"]:
                     if elm["instId"] == self.symbol and "averageOpenPrice" in elm:
-                        standardized = {
-                            f"psize_{elm['holdSide']}": round_(
-                                abs(float(elm["total"])), self.qty_step
+                        if elm["holdSide"] == "long":
+                            long_pos["psize_long"] = round_(abs(float(elm["total"])), self.qty_step)
+                            long_pos["pprice_long"] = truncate_float(
+                                elm["averageOpenPrice"], self.price_rounding
                             )
-                            * (-1 if elm["holdSide"] == "short" else 1),
-                            f"pprice_{elm['holdSide']}": truncate_float(
-                                float(elm["averageOpenPrice"]), self.price_rounding
-                            ),
-                        }
-                        events.append(standardized)
+                        elif elm["holdSide"] == "short":
+                            short_pos["psize_short"] = -abs(
+                                round_(abs(float(elm["total"])), self.qty_step)
+                            )
+                            short_pos["pprice_short"] = truncate_float(
+                                elm["averageOpenPrice"], self.price_rounding
+                            )
+                # absence of elemet means no pos
+                events.append(long_pos)
+                events.append(short_pos)
 
             if event["arg"]["channel"] == "account":
                 for elm in event["data"]:
